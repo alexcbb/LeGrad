@@ -49,7 +49,6 @@ def hooked_attention_forward(self, x, x_k, x_v, attn_mask: Optional[torch.Tensor
     x = self.out_proj(x)
     return x
 
-
 # ------------ Hooked Residual Transformer Block ------------
 # from https://github.com/mlfoundations/open_clip/blob/73fa7f03a33da53653f61841eb6d69aef161e521/src/open_clip/transformer.py#L231
 def hooked_resblock_forward(
@@ -61,7 +60,7 @@ def hooked_resblock_forward(
 ):
     k_x = self.ln_1_kv(k_x) if hasattr(self, "ln_1_kv") and k_x is not None else None
     v_x = self.ln_1_kv(v_x) if hasattr(self, "ln_1_kv") and v_x is not None else None
-
+    
     x = q_x + self.ls_1(self.attention(q_x=self.ln_1(q_x), k_x=k_x, v_x=v_x, attn_mask=attn_mask))
     # Hook for intermediate features post Attn
     self.feat_post_attn = x
@@ -70,6 +69,17 @@ def hooked_resblock_forward(
     self.feat_post_mlp = x
     return x
 
+def clip_hooked_resblock_forward(
+        self,
+        x: torch.Tensor
+):
+    x = x + self.ls_1(self.attention(self.ln_1(x)))
+    # Hook for intermediate features post Attn
+    self.feat_post_attn = x
+    x = x + self.ls_2(self.mlp(self.ln_2(x)))
+    # Hook for intermediate features post MLP
+    self.feat_post_mlp = x
+    return x
 
 # ------------ Hooked PyTorch's Multi-Head AttentionResidual ------------
 # modified from PyTorch Library
@@ -383,7 +393,6 @@ def hooked_torch_func_multi_head_attention_forward(query: Tensor,
         return attn_output, attn_output_weights
     else:
         return attn_output, None
-
 
 # ------------ Hooked TimmModel's Residual Transformer Block ------------
 def hooked_resblock_timm_forward(self, x: torch.Tensor) -> torch.Tensor:

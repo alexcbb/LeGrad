@@ -6,11 +6,12 @@ import torch.nn.functional as F
 from torchvision.transforms import Compose, Resize, InterpolationMode
 import open_clip
 from open_clip.transformer import VisionTransformer
+from clip.model import VisionTransformer as ClipVisionTransformer
 from open_clip.timm_model import TimmModel
 from einops import rearrange
 
 from .utils import hooked_resblock_forward, \
-    hooked_attention_forward, \
+    clip_hooked_resblock_forward, \
     hooked_resblock_timm_forward, \
     hooked_attentional_pooler_timm_forward, \
     vit_dynamic_size_forward, \
@@ -36,7 +37,7 @@ class LeWrapper(nn.Module):
     def _activate_hooks(self, layer_index):
         # ------------ identify model's type ------------
         print('Activating necessary hooks and gradients ....')
-        if isinstance(self.visual, VisionTransformer):
+        if isinstance(self.visual, VisionTransformer) or isinstance(self.visual, ClipVisionTransformer):
             # --- Activate dynamic image size ---
             self.visual.forward = types.MethodType(vit_dynamic_size_forward, self.visual)
             # Get patch size
@@ -47,6 +48,7 @@ class LeWrapper(nn.Module):
 
             if self.visual.attn_pool is None:
                 self.model_type = 'clip'
+                print('Using CLIP model')
                 self._activate_self_attention_hooks()
             else:
                 self.model_type = 'coca'
@@ -67,6 +69,7 @@ class LeWrapper(nn.Module):
                 self.visual.trunk.blocks) + layer_index
             self._activate_timm_attn_pool_hooks(layer_index=layer_index)
         else:
+            print(f"type(self.visual) = {type(self.visual)}")
             raise ValueError(
                 "Model currently not supported, see legrad.list_pretrained() for a list of available models")
         print('Hooks and gradients activated!')
@@ -81,15 +84,24 @@ class LeWrapper(nn.Module):
                 depth = int(name.split('visual.transformer.resblocks.')[-1].split('.')[0])
                 if depth >= self.starting_depth:
                     param.requires_grad = True
+            elif name.startswith('model.transformer.resblocks'):
+                depth = int(name.split('model.transformer.resblocks.')[-1].split('.')[0])
+                if depth >= self.starting_depth:
+                    param.requires_grad = True
 
         # --- Activate the hooks for the specific layers ---
         for layer in range(self.starting_depth, len(self.visual.transformer.resblocks)):
             self.visual.transformer.resblocks[layer].attn.forward = types.MethodType(hooked_torch_multi_head_attention_forward,
                                                                                      self.visual.transformer.resblocks[
                                                                                          layer].attn)
-            self.visual.transformer.resblocks[layer].forward = types.MethodType(hooked_resblock_forward,
-                                                                                self.visual.transformer.resblocks[
-                                                                                    layer])
+            if isinstance(self.visual, ClipVisionTransformer):
+                self.visual.transformer.resblocks[layer].forward = types.MethodType(clip_hooked_resblock_forward,
+                                                                                    self.visual.transformer.resblocks[
+                                                                                        layer])
+            else:
+                self.visual.transformer.resblocks[layer].forward = types.MethodType(hooked_resblock_forward,
+                                                                                    self.visual.transformer.resblocks[
+                                                                                        layer])
 
     def _activate_att_pool_hooks(self, layer_index):
         # ---------- Apply Hooks + Activate/Deactivate gradients ----------
@@ -141,11 +153,11 @@ class LeWrapper(nn.Module):
         elif 'coca' in self.model_type:
             return self.compute_legrad_coca(text_embedding, image)
 
-    def compute_legrad_clip(self, text_embedding, image=None, return_img_feats=False):
+    def compute_legrad_clip(self, text_embedding, image=None):
         num_prompts = text_embedding.shape[0]
         if image is not None:
             image = image.repeat(num_prompts, 1, 1, 1)
-            img_feats = self.encode_image(image)
+            _ = self(image)
 
         blocks_list = list(dict(self.visual.transformer.resblocks.named_children()).values())
 
@@ -183,10 +195,8 @@ class LeWrapper(nn.Module):
 
         # Min-Max Norm
         accum_expl_map = min_max(accum_expl_map)
-        if return_img_feats:
-            return accum_expl_map, img_feats
         return accum_expl_map
-
+    
     def compute_legrad_clip_batch(self, text_embeddings, images, return_img_feats=False):
         """
         text_embeddings: [B, N, D]
@@ -222,7 +232,7 @@ class LeWrapper(nn.Module):
             one_hot = sim_diag.sum()
 
             attn_map = blocks_list[self.starting_depth + layer].attn.attention_maps  # [B*N * num_heads, N, N]
-            grad = torch.autograd.grad(one_hot, [attn_map], retain_graph=True, create_graph=True)[0]
+            grad = torch.autograd.grad(one_hot, [attn_map], retain_graph=True, create_graph=True, allow_unused=True)[0]
             grad = rearrange(grad, '(bn h) n m -> bn h n m', bn=B * N)  # [B*N, H, N, N]
             grad = torch.clamp(grad, min=0.)
 
@@ -238,6 +248,7 @@ class LeWrapper(nn.Module):
         if return_img_feats:
             return accum_expl_map.squeeze(0), img_feats
         return accum_expl_map.squeeze(0)  # [B, N, H, W]
+
 
     def compute_legrad_coca(self, text_embedding, image=None):
         if image is not None:
